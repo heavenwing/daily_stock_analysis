@@ -14,6 +14,39 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
     def tearDown(self):
         Config.reset_instance()
 
+    def test_postgresql_url_overrides_sqlite_without_creating_a_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "unused" / "analysis.db"
+            with patch.dict(os.environ, {
+                "ENV_FILE": str(Path(directory) / ".env"),
+                "DATABASE_PATH": str(path),
+                "DATABASE_URL": "postgresql://test@localhost/dsa?sslmode=require",
+            }):
+                config = Config.get_instance()
+                self.assertEqual(config.get_db_url(), "postgresql+psycopg://test@localhost/dsa?sslmode=require")
+                self.assertNotIn("sslmode", repr(config))
+                self.assertFalse(path.parent.exists())
+
+    def test_invalid_database_url_is_not_silently_replaced_by_sqlite(self):
+        config = Config(database_url="unsupported://example-marker@localhost/dsa")
+        issue = next(issue for issue in config.validate_structured() if issue.field == "DATABASE_URL")
+        self.assertEqual(issue.severity, "error")
+        self.assertNotIn("example-marker", issue.message)
+        with self.assertRaisesRegex(ValueError, "DATABASE_URL"):
+            config.get_db_url()
+
+    def test_database_url_is_not_reloaded_from_env_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            original = "postgresql://test@localhost/first"
+            path.write_text(f"DATABASE_URL={original}\n", encoding="utf-8")
+            with patch.dict(os.environ, {"ENV_FILE": str(path)}):
+                os.environ.pop("DATABASE_URL", None)
+                setup_env()
+                path.write_text("DATABASE_URL=\n", encoding="utf-8")
+                setup_env(override=True)
+                self.assertEqual(os.environ["DATABASE_URL"], original)
+
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     @patch.object(Config, "_parse_stock_email_groups", return_value=[])

@@ -40,6 +40,7 @@ from src.config import (
     normalize_llm_channel_model,
     parse_env_bool,
     parse_env_int,
+    parse_postgresql_url,
     resolve_news_window_days,
     resolve_llm_channel_base_url,
     resolve_llm_channel_models,
@@ -2494,6 +2495,14 @@ class SystemConfigService:
         for item in items:
             key = item["key"].upper()
             value = item["value"]
+            if key == "DATABASE_URL":
+                issues.append({
+                    "key": key,
+                    "code": "deployment_only",
+                    "message": "Set DATABASE_URL in the deployment environment or .env, then restart the application.",
+                    "severity": "error",
+                })
+                continue
             field_schema = get_field_definition(key, value)
             is_sensitive = bool(field_schema.get("is_sensitive", False))
 
@@ -3450,6 +3459,7 @@ class SystemConfigService:
         if key in {
             "STOCK_LIST",
             "DATABASE_PATH",
+            "DATABASE_URL",
             "LITELLM_CONFIG",
             "LITELLM_MODEL",
             "LITELLM_FALLBACK_MODELS",
@@ -4084,6 +4094,22 @@ class SystemConfigService:
         raw_db_path = (effective_map.get("DATABASE_PATH") or "./data/stock_analysis.db").strip()
         db_path = Path(raw_db_path).expanduser()
         parent = db_path.parent if db_path.parent != Path("") else Path(".")
+        database_url = (effective_map.get("DATABASE_URL") or "").strip()
+        if database_url:
+            try:
+                parse_postgresql_url(database_url)
+            except ValueError as exc:
+                return self._setup_check("storage", "数据库 / 本地存储", "system", True, "needs_action", str(exc))
+            writable, _ = _inspect_dir_writable(str(parent))
+            if not writable:
+                return self._setup_check(
+                    "storage", "数据库 / 本地存储", "system", True, "needs_action",
+                    "本地状态目录不可写。", "请检查 DATABASE_PATH 所在目录的权限。",
+                )
+            return self._setup_check(
+                "storage", "数据库 / 本地存储", "system", True, "configured",
+                "已配置 PostgreSQL，本地状态目录可用；此处不检查数据库连接。",
+            )
 
         try:
             if db_path.is_symlink() and not db_path.exists():

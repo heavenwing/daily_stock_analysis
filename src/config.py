@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
 from urllib.parse import unquote, urlparse
 from dotenv import load_dotenv, dotenv_values
 from dataclasses import dataclass, field
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import ArgumentError
 
 from src.core.config_manager import unescape_compose_sensitive_env_value
 from src.report_language import (
@@ -972,6 +974,18 @@ def get_effective_agent_models_to_try(config: "Config") -> List[str]:
     return ordered_models
 
 
+def parse_postgresql_url(value: str) -> URL:
+    """Validate a deployment DSN without exposing credentials in parser errors."""
+    message = "DATABASE_URL must be a PostgreSQL URL (postgresql:// or postgresql+psycopg://) with a database name."
+    try:
+        url = make_url(value.strip())
+    except (ArgumentError, ValueError):
+        raise ValueError(message) from None
+    if url.drivername not in {"postgresql", "postgresql+psycopg"} or not url.database:
+        raise ValueError(message)
+    return url.set(drivername="postgresql+psycopg")
+
+
 def setup_env(override: bool = False):
     """
     Initialize environment variables from .env file.
@@ -996,7 +1010,13 @@ def setup_env(override: bool = False):
     preexisting_compose_sensitive_keys = {
         key for key in compose_sensitive_keys if key in os.environ
     }
+    database_url = os.environ.get("DATABASE_URL", "")
     load_dotenv(dotenv_path=env_path, override=override)
+    if override:
+        # Live config reloads must not change the process's database binding.
+        os.environ["DATABASE_URL"] = database_url
+    else:
+        os.environ.setdefault("DATABASE_URL", "")
     try:
         raw_env_values = dotenv_values(env_path, interpolate=False)
     except Exception as exc:  # pragma: no cover - defensive branch
@@ -1332,6 +1352,7 @@ class Config:
 
     # === 数据库配置 ===
     database_path: str = "./data/stock_analysis.db"
+    database_url: str = field(default="", repr=False)
     sqlite_wal_enabled: bool = True
     sqlite_busy_timeout_ms: int = 5000
     sqlite_write_retry_max: int = 3
@@ -2334,6 +2355,7 @@ class Config:
             share_image_xiaohongshu_qr_path=(os.getenv('SHARE_IMAGE_XIAOHONGSHU_QR_PATH') or '').strip() or None,
             prefetch_realtime_quotes=os.getenv('PREFETCH_REALTIME_QUOTES', 'true').lower() == 'true',
             database_path=os.getenv('DATABASE_PATH', './data/stock_analysis.db'),
+            database_url=(os.getenv('DATABASE_URL') or '').strip(),
             sqlite_wal_enabled=os.getenv('SQLITE_WAL_ENABLED', 'true').lower() == 'true',
             sqlite_busy_timeout_ms=parse_env_int(
                 os.getenv('SQLITE_BUSY_TIMEOUT_MS'),
@@ -3431,6 +3453,12 @@ class Config:
         """
         issues: List[ConfigIssue] = []
 
+        if self.database_url:
+            try:
+                parse_postgresql_url(self.database_url)
+            except ValueError as exc:
+                issues.append(ConfigIssue(severity="error", message=str(exc), field="DATABASE_URL"))
+
         # --- Stock list ---
         if not self.stock_list:
             issues.append(ConfigIssue(
@@ -4030,6 +4058,8 @@ class Config:
         
         自动创建数据库目录（如果不存在）
         """
+        if self.database_url:
+            return parse_postgresql_url(self.database_url).render_as_string(hide_password=False)
         db_path = Path(self.database_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
         return f"sqlite:///{db_path.absolute()}"

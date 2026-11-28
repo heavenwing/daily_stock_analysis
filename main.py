@@ -170,7 +170,7 @@ def _read_active_env_values() -> Optional[Dict[str, str]]:
 _ACTIVE_ENV_FILE_VALUES = _read_active_env_values() or {}
 _RUNTIME_ENV_FILE_KEYS = {
     key for key in _ACTIVE_ENV_FILE_VALUES
-    if key not in _INITIAL_PROCESS_ENV
+    if key not in _INITIAL_PROCESS_ENV and key != "DATABASE_URL"
 }
 
 # setup_env() already ran at import time above.
@@ -289,7 +289,7 @@ def _reload_env_file_values_preserving_overrides() -> None:
 
     managed_keys = {
         key for key in latest_values
-        if key not in _INITIAL_PROCESS_ENV
+        if key not in _INITIAL_PROCESS_ENV and key != "DATABASE_URL"
     }
 
     for key in _RUNTIME_ENV_FILE_KEYS - managed_keys:
@@ -1512,6 +1512,12 @@ def start_api_server(host: str, port: int, config: Config) -> None:
     # genuine import failures still surface immediately to the caller.
     from api.app import app as fastapi_app
     from api.middlewares.security_guard import uvicorn_proxy_kwargs
+
+    if config.database_url:
+        # Finish database setup before the short Uvicorn listener probe.
+        from src.storage import get_db
+
+        get_db()
 
     uvicorn_kwargs.update(uvicorn_proxy_kwargs())
 

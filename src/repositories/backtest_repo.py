@@ -11,7 +11,8 @@ import logging
 from datetime import date, datetime, timedelta
 from typing import List, Optional, Tuple
 
-from sqlalchemy import and_, case, delete, desc, func, or_, select
+from sqlalchemy import and_, case, cast, delete, desc, func, or_, select
+from sqlalchemy.dialects.postgresql import JSONB
 
 from src.core.backtest_engine import OVERALL_SENTINEL_CODE
 from src.services.stock_code_utils import resolve_daily_stock_identity
@@ -499,8 +500,8 @@ class BacktestRepository:
             ).scalars().all()
             return [int(w) for w in rows if w is not None]
 
-    @staticmethod
     def _build_result_conditions(
+        self,
         *,
         code: Optional[str],
         eval_window_days: Optional[int],
@@ -512,7 +513,7 @@ class BacktestRepository:
     ) -> List[object]:
         conditions = []
         if code_candidates is not None:
-            conditions.append(BacktestRepository._strict_result_code_condition(code_candidates))
+            conditions.append(self._strict_result_code_condition(code_candidates))
         elif code:
             conditions.extend(BacktestRepository._build_code_conditions(BacktestResult.code, code))
         if eval_window_days is not None:
@@ -528,8 +529,7 @@ class BacktestRepository:
             conditions.append(BacktestResult.evaluated_at >= cutoff)
         return conditions
 
-    @staticmethod
-    def _strict_result_code_condition(code_candidates: Tuple[str, ...]):
+    def _strict_result_code_condition(self, code_candidates: Tuple[str, ...]):
         """Use the fixed storage namespace and existing source FK, not an index.
 
         Qualified keys retain their existing identity. Numeric CN writer keys
@@ -540,8 +540,13 @@ class BacktestRepository:
         if not numeric:
             return BacktestResult.code.in_(code_candidates)
         qualified = tuple(value for value in code_candidates if not value.isdigit())
-        snapshot = case((func.json_valid(AnalysisHistory.context_snapshot), AnalysisHistory.context_snapshot), else_="{}")
-        market = func.json_extract(snapshot, "$.market_phase_summary.market")
+        snapshot = AnalysisHistory.context_snapshot
+        if self.db.is_postgresql:
+            validated = case((func.pg_input_is_valid(snapshot, "jsonb"), snapshot))
+            market = func.jsonb_extract_path_text(cast(validated, JSONB), "market_phase_summary", "market")
+        else:
+            validated = case((func.json_valid(snapshot), snapshot), else_="{}")
+            market = func.json_extract(validated, "$.market_phase_summary.market")
         source = select(AnalysisHistory.id).where(
             AnalysisHistory.id == BacktestResult.analysis_history_id,
             AnalysisHistory.code.in_(code_candidates),

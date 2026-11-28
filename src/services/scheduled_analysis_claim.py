@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Atomic occurrence claims for schedulers sharing the analysis SQLite file."""
+"""Atomic occurrence claims for schedulers sharing the analysis database."""
 
 from __future__ import annotations
 
@@ -44,6 +44,12 @@ def claim_scheduled_analysis(config: Any, args: Any, scheduled_for: datetime) ->
         json.dumps(workload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     occurrence = scheduled_for.astimezone(timezone.utc).isoformat()
+    if getattr(config, "database_url", ""):
+        from src.storage import DatabaseManager
+
+        return DatabaseManager(db_url=config.get_db_url()).claim_scheduled_analysis(
+            occurrence, workload_key, time.time(),
+        )
     database_path = Path(getattr(config, "database_path", "./data/stock_analysis.db"))
     database_path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(str(database_path), timeout=10)) as connection:

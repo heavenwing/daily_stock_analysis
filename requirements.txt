@@ -6,6 +6,7 @@
 python-dotenv>=1.0.0        # Environment variable configuration
 tenacity>=8.2.0             # Retry support with exponential backoff
 sqlalchemy>=2.0.0           # ORM database access
+psycopg[binary]>=3.2,<4     # PostgreSQL driver; SQLite still uses the standard library
 schedule>=1.2.0             # Scheduled task runner
 exchange-calendars>=4.13.0   # Trading calendars; 4.5.x is incompatible with pandas 3 Timedelta "T"
 
@@ -60,9 +61,6 @@ fake-useragent>=1.4.0       # Random User-Agent support
 httpx[socks]                # HTTP client with SOCKS proxy support; optional OpenAI dependency
 dingtalk-stream >= 0.24.3    # DingTalk Stream SDK
 wecom-aibot-python-sdk >= 1.0.2    # WeCom AI Bot (smart robot) WebSocket long-connection SDK; optional at runtime (degrades gracefully when missing)
-# Database
-# SQLite is built into Python and does not need an extra package
-
 # Discord bot
 discord.py>=2.0.0              # Discord bot development library
 PyNaCl>=1.5.0                  # Discord Interaction/Webhook Ed25519 signature verification

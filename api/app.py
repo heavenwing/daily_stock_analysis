@@ -238,6 +238,14 @@ def _load_runtime_scheduler_args() -> dict:
 @asynccontextmanager
 async def app_lifespan(app: FastAPI):
     """Initialize and release shared services for the app lifecycle."""
+    from src.config import get_config
+
+    config = get_config()
+    if config.database_url:
+        from src.storage import get_db
+
+        await run_in_threadpool(get_db)
+
     runtime_owns_schedule = os.getenv(CLI_SCHEDULER_OWNER_ENV, "").strip().lower() not in {
         "1",
         "true",
@@ -260,9 +268,7 @@ async def app_lifespan(app: FastAPI):
     if runtime_suppress_start or not runtime_owns_schedule:
         runtime_run_immediately = False
     elif runtime_run_immediately_override is None:
-        from src.config import get_config
-
-        runtime_run_immediately = bool(getattr(get_config(), "schedule_run_immediately", False))
+        runtime_run_immediately = config.schedule_run_immediately
     else:
         runtime_run_immediately = runtime_run_immediately_override.strip().lower() in {
             "1",

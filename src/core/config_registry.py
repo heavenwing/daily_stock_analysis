@@ -75,6 +75,7 @@ WEB_SETTINGS_HIDDEN_FROM_UI = {
     # when a tool runs; it is not a Web settings or model-input field.
     "FXMACRODATA_API_KEY",
     "DATABASE_PATH",
+    "DATABASE_URL",
     "SQLITE_WAL_ENABLED",
     "SQLITE_BUSY_TIMEOUT_MS",
     "SQLITE_WRITE_RETRY_MAX",
@@ -5389,7 +5390,7 @@ def build_schema_response() -> Dict[str, Any]:
 
 def _is_sensitive_key(key: str) -> bool:
     markers = ("KEY", "TOKEN", "SECRET", "PASSWORD")
-    return any(marker in key for marker in markers)
+    return key == "DATABASE_URL" or any(marker in key for marker in markers)
 
 
 def _infer_category(key: str) -> str:

@@ -57,6 +57,19 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.manager = ConfigManager(env_path=self.env_path)
         self.service = SystemConfigService(manager=self.manager)
 
+    def test_database_url_cannot_be_changed_or_leaked_via_settings(self) -> None:
+        dsn = "postgresql://test@localhost/dsa"
+        self._rewrite_env("STOCK_LIST=600519", f"DATABASE_URL={dsn}")
+        settings = self.service.get_config()
+        self.assertNotIn(dsn, json.dumps(settings))
+        with self.assertRaises(ConfigValidationError) as error:
+            self.service.update(
+                config_version=self.manager.get_config_version(),
+                items=[{"key": "DATABASE_URL", "value": ""}],
+            )
+        self.assertEqual(error.exception.issues[0]["code"], "deployment_only")
+        self.assertEqual(self.manager.read_config_map()["DATABASE_URL"], dsn)
+
     # The regular primary model resolves cleanly; only AGENT_LITELLM_MODEL sits
     # on a Hermes-only route. Fixtures built from this therefore fail for exactly
     # one reason, so an assertion about the Agent check cannot be satisfied by an

@@ -58,6 +58,8 @@ def _api_app_stub_modules():
 
 
 class _DummyConfig(SimpleNamespace):
+    database_url = ""
+
     def validate(self):
         return []
 
@@ -340,6 +342,19 @@ class MainScheduleModeTestCase(unittest.TestCase):
 
         socket_factory.assert_called_once_with(socket.AF_INET, socket.SOCK_STREAM)
         self.assertIn("127.0.0.1:8000", str(caught.exception))
+        thread_cls.assert_not_called()
+
+    def test_start_api_server_checks_postgresql_before_starting_uvicorn(self) -> None:
+        config = self._make_config(log_level="INFO")
+        config.database_url = "postgresql://test@localhost/dsa"
+
+        with patch("socket.socket"), \
+             patch.dict("sys.modules", _api_app_stub_modules()), \
+             patch("src.storage.get_db", side_effect=RuntimeError("database unavailable")), \
+             patch("threading.Thread") as thread_cls:
+            with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+                main.start_api_server("127.0.0.1", 8000, config)
+
         thread_cls.assert_not_called()
 
     def test_start_api_server_fails_when_uvicorn_background_startup_fails(self) -> None:

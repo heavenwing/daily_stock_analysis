@@ -137,7 +137,7 @@ class PortfolioRepository:
     def portfolio_write_session(self):
         session = self.db.get_session()
         try:
-            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            self.db.acquire_write_lock(session)
         except OperationalError as exc:
             session.close()
             if self._is_sqlite_locked_error(exc):

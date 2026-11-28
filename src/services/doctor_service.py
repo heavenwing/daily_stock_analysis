@@ -414,7 +414,11 @@ def run_doctor_diagnostics(config: Config) -> Dict[str, Any]:
         notify_status = "ok"
 
     db_path = getattr(config, "database_path", None)
-    db_writable = _check_database_path_usable(db_path)
+    use_postgresql = bool(getattr(config, "database_url", ""))
+    db_writable = (
+        _check_dir_writable(Path(db_path).expanduser().parent)
+        if use_postgresql and db_path else _check_database_path_usable(db_path)
+    )
     log_writable = _check_dir_writable(getattr(config, "log_dir", None))
     storage_status = "ok" if (db_writable and log_writable) else "error"
 
@@ -497,6 +501,7 @@ def run_doctor_diagnostics(config: Config) -> Dict[str, Any]:
             },
             "storage": {
                 "status": storage_status,
+                "database_backend": "postgresql" if use_postgresql else "sqlite",
                 "database_dir_writable": db_writable,
                 "log_dir_writable": log_writable,
             },
@@ -537,6 +542,7 @@ def format_doctor_report(report: Dict[str, Any]) -> str:
     storage = checks.get("storage", {})
     lines.append(
         f"[storage] status={storage.get('status')} "
+        f"backend={storage.get('database_backend')} "
         f"db_dir_writable={storage.get('database_dir_writable')} "
         f"log_dir_writable={storage.get('log_dir_writable')}"
     )

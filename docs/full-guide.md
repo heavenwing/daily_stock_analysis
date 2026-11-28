@@ -1586,6 +1586,22 @@ python main.py --debug
 
 调试日志默认保留项目自身 DEBUG 信息，但会将 LiteLLM 内部日志压低到 `WARNING`，避免流式生成时按 token 写入大量第三方调试日志；如需排查 LiteLLM 内部细节，可在 `.env` 中临时设置 `LITELLM_LOG_LEVEL=DEBUG`。
 
+### 数据库：SQLite 或 PostgreSQL
+
+默认使用 `DATABASE_PATH` 指定的 SQLite 文件，无需配置数据库服务。要切换到 PostgreSQL 16 或更高版本（包括 Azure Database for PostgreSQL），先创建一个专用数据库，为应用账号授予目标 schema 的建表及读写权限，然后在部署环境或 `.env` 设置 `DATABASE_URL` 并重启：
+
+```dotenv
+DATABASE_URL=postgresql+psycopg://user:password@host:5432/dsa?sslmode=verify-full
+```
+
+也接受 `postgresql://`。生产环境请通过部署平台的密钥设置注入连接串，并为 TLS 验证配置可信 CA；不要提交真实连接串或通过 Web 设置导入它。Web 的原始 `.env` 备份包含文件里已有的配置，因此建议由部署环境注入密钥。应用会在首次连接时建表，连接或建表失败不会回退到 SQLite。
+
+`DATABASE_PATH` 的父目录仍存放本地状态，例如管理员凭据和启动补跑标记；请保持该目录持久化且可写。`--doctor` 和 Web 首次配置检查保持离线，不测试数据库连通性。
+
+切换不会复制或删除既有数据。回退时清除 `DATABASE_URL` 并重启，即可重新使用原 SQLite 文件；期间写入 PostgreSQL 的记录留在 PostgreSQL。首次上线建议保留一个应用实例，避免把数据库切换和跨实例部署一并验证。
+
+运行真实数据库集成测试：用 Docker 的 `postgres:16-alpine` 启动本机专用测试数据库，设置 `TEST_POSTGRESQL_URL`（账号需有 `CREATE SCHEMA` 权限），再运行 `python -m pytest tests/test_postgresql.py`。测试只在随机命名的 schema 中读写，并在结束后删除该 schema。未配置测试连接串时跳过这些用例。
+
 ### SQLite 写入稳态配置
 
 默认文件型 SQLite 会在连接建立时启用 `WAL` 并设置 `busy_timeout`，`save_daily_data()` 也已改为按 `(code, date)` 批量原子 upsert，以降低批量更新和并发回写时的锁竞争。

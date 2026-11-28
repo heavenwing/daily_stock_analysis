@@ -1404,6 +1404,22 @@ Log file locations:
 
 Debug logs keep the app's own DEBUG messages, but LiteLLM internals default to `WARNING` to avoid token-level third-party noise during streaming generation. To inspect LiteLLM internals temporarily, set `LITELLM_LOG_LEVEL=DEBUG` in `.env`.
 
+### Database: SQLite or PostgreSQL
+
+SQLite remains the default and uses the file at `DATABASE_PATH`. To switch to PostgreSQL 16 or newer (including Azure Database for PostgreSQL), create a dedicated database, grant the app permission to create tables and read/write in its target schema, set `DATABASE_URL` in the deployment environment or `.env`, and restart:
+
+```dotenv
+DATABASE_URL=postgresql+psycopg://user:password@host:5432/dsa?sslmode=verify-full
+```
+
+`postgresql://` is also accepted. In production, inject the URL through deployment secrets and configure a trusted CA for TLS verification. Do not commit the URL or import it through Web Settings. Raw `.env` backups include values stored in the file, so prefer injecting credentials through the deployment environment. The app creates tables on first connection. Connection or schema initialization failures do not fall back to SQLite.
+
+The parent directory of `DATABASE_PATH` still stores local state such as admin credentials and the startup deduplication marker. Keep it writable and persistent. `--doctor` and the Web setup check remain offline and do not test database connectivity.
+
+Switching does not copy or delete existing data. To revert, unset `DATABASE_URL` and restart to use the original SQLite file; records written to PostgreSQL remain there. Start with one app instance when rolling out the database change.
+
+For integration tests, run the `postgres:16-alpine` Docker image locally with a dedicated test database, set `TEST_POSTGRESQL_URL` for a user with `CREATE SCHEMA` permission, and run `python -m pytest tests/test_postgresql.py`. Tests use randomly named schemas and drop them afterward. Without the test URL, these cases are skipped.
+
 ### SQLite Write Stability
 
 For file-based SQLite databases, the app now enables `WAL` and sets `busy_timeout` on connection startup. `save_daily_data()` also uses a batch atomic upsert on `(code, date)` to reduce lock contention during bulk writes and concurrent callbacks.

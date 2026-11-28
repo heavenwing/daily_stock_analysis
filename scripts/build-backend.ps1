@@ -151,6 +151,8 @@ $pyInstallerArgs = @(
   '--collect-data', 'tiktoken',
   '--collect-data', 'akshare',
   '--collect-data', 'fxmacrodata_public',
+  '--hidden-import', 'sqlalchemy.dialects.postgresql.psycopg',
+  '--collect-all', 'psycopg_binary',
   '--collect-all', 'py_mini_racer',
   '--collect-all', 'fin_primitives',
   '--collect-all', 'src.services.screening',

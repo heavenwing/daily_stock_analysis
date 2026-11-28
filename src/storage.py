@@ -50,13 +50,16 @@ from sqlalchemy import (
     MetaData,
     Table,
 )
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.dialects.postgresql import Insert as PostgreSQLInsert, insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import Insert as SQLiteInsert, insert as sqlite_insert
+from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.orm import (
     declarative_base,
     sessionmaker,
     Session,
 )
 from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.schema import conv
 
 from src.agent.provider_trace import PROVIDER_TRACE_RETENTION_LIMIT
 from src.agent.tools.execution import TOOL_CANCEL_EVENT, is_tool_cancellation_requested
@@ -70,6 +73,8 @@ T = TypeVar("T")
 CURRENT_SCHEMA_VERSION = "2026-06-05-create-all-baseline"
 CHAT_STATE_SCHEMA_VERSION = "2026-10-06-chat-active-stock"
 INTELLIGENCE_ITEM_NULL_SCOPE_VALUE = "__dsa_null_scope__"
+# Fixed per-database lock shared by processes that write through the storage layer.
+_POSTGRESQL_WRITE_LOCK = 0x445341
 
 # SQLAlchemy ORM 基类
 Base = declarative_base()
@@ -100,6 +105,14 @@ class DatabaseSchemaMigration(Base):
     version = Column(String(64), primary_key=True)
     description = Column(String(255), nullable=False)
     applied_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
+
+class ScheduledAnalysisClaim(Base):
+    __tablename__ = "scheduled_analysis_claims"
+
+    occurrence = Column(Text, primary_key=True)
+    workload = Column(Text, primary_key=True)
+    claimed_at = Column(Float, nullable=False)
 
 
 class StockDaily(Base):
@@ -1107,7 +1120,7 @@ class DecisionSignalRecord(Base):
         Index('ix_decision_signal_stock_status_time', 'stock_code', 'status', 'created_at'),
         Index('ix_decision_signal_market_status_time', 'market', 'status', 'created_at'),
         Index(
-            'ix_decision_signal_report_type_market_stock_action_horizon_phase',
+            conv('ix_decision_signal_report_type_market_stock_action_horizon_phase'),
             'source_report_id',
             'source_type',
             'market',
@@ -1127,7 +1140,7 @@ class DecisionSignalRecord(Base):
             'market_phase',
         ),
         Index(
-            'ix_decision_signal_report_type_market_stock_profile_action_horizon_phase',
+            conv('ix_decision_signal_report_type_market_stock_profile_action_horizon_phase'),
             'source_report_id',
             'source_type',
             'market',
@@ -1138,7 +1151,7 @@ class DecisionSignalRecord(Base):
             'market_phase',
         ),
         Index(
-            'ix_decision_signal_trace_type_market_stock_profile_action_horizon_phase',
+            conv('ix_decision_signal_trace_type_market_stock_profile_action_horizon_phase'),
             'trace_id',
             'source_type',
             'market',
@@ -1378,11 +1391,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             if requested_db_url == getattr(instance, '_db_url', None):
                 return instance
 
-            logger.info(
-                "DatabaseManager detected different db_url, switching binding: %r -> %r",
-                getattr(instance, '_db_url', None),
-                requested_db_url,
-            )
+            logger.info("DatabaseManager detected a database binding change")
             # 候选绑定模式：先在全新的实例上完整初始化目标库（校验 URL →
             # 建引擎 → 建 Session 工厂 → 建表/迁移），全部成功后才原子发布
             # 为类级单例并返回候选；任一步失败则丢弃候选，现有健康单例与
@@ -1433,6 +1442,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 db_url = config.get_db_url()
 
             self._db_url = db_url
+            url = make_url(db_url)
+            backend = url.get_backend_name()
             self._sqlite_wal_enabled = config.sqlite_wal_enabled
             self._sqlite_busy_timeout_ms = config.sqlite_busy_timeout_ms
             self._sqlite_write_retry_max = config.sqlite_write_retry_max
@@ -1442,10 +1453,14 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 "echo": False,
                 "pool_pre_ping": True,
             }
-            if str(db_url).startswith("sqlite:") and self._sqlite_busy_timeout_ms > 0:
+            if backend == "sqlite" and self._sqlite_busy_timeout_ms > 0:
                 engine_kwargs["connect_args"] = {
                     "timeout": self._sqlite_busy_timeout_ms / 1000,
                 }
+            elif backend == "postgresql":
+                engine_kwargs["isolation_level"] = "READ COMMITTED"
+                if "connect_timeout" not in url.query:
+                    engine_kwargs["connect_args"] = {"connect_timeout": 5}
 
             # 创建数据库引擎
             created_engine = create_engine(
@@ -1453,7 +1468,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 **engine_kwargs,
             )
             self._engine = created_engine
-            self._is_sqlite_engine = self._engine.url.get_backend_name() == 'sqlite'
+            self._is_sqlite_engine = backend == "sqlite"
             self._sqlite_file_db = self._is_sqlite_engine and self._is_file_sqlite_database()
             self._install_sqlite_pragma_handler()
 
@@ -1465,7 +1480,14 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             )
 
             # 创建所有表
-            Base.metadata.create_all(self._engine)
+            if self.is_postgresql:
+                with self._engine.begin() as connection:
+                    if connection.dialect.server_version_info < (16,):
+                        raise RuntimeError("PostgreSQL 16 or newer is required")
+                    self._lock_postgresql_writes(connection)
+                    Base.metadata.create_all(connection)
+            else:
+                Base.metadata.create_all(self._engine)
             self._ensure_llm_usage_telemetry_columns()
             self._ensure_decision_signal_profile_schema()
             self._ensure_stock_daily_canonical_id()
@@ -1475,7 +1497,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._ensure_chat_session_schema()
 
             self._initialized = True
-            logger.info(f"Database initialization completed: {db_url}")
+            logger.info("Database initialization completed (%s)", backend)
 
             # 注册退出钩子，确保程序退出时关闭数据库连接
             atexit.register(DatabaseManager._cleanup_engine, self._engine)
@@ -1509,12 +1531,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             "description": description,
         }
         try:
-            if self._is_sqlite_engine:
-                statement = sqlite_insert(DatabaseSchemaMigration).values(**values)
-                statement = statement.on_conflict_do_nothing(index_elements=["version"])
-                session.execute(statement)
-            else:
-                session.execute(DatabaseSchemaMigration.__table__.insert().values(**values))
+            statement = self.conflict_insert(DatabaseSchemaMigration.__table__).values(**values)
+            session.execute(statement.on_conflict_do_nothing(index_elements=["version"]))
             session.commit()
         except IntegrityError:
             session.rollback()
@@ -1577,8 +1595,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         for attempt in range(self._sqlite_write_retry_max + 1):
             session = self._SessionLocal()
             try:
-                if self._is_sqlite_engine:
-                    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+                self.acquire_write_lock(session)
                 states = {row.session_id: row for row in session.execute(
                     select(ConversationSessionState)
                 ).scalars()}
@@ -2387,6 +2404,41 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         database = (self._engine.url.database or "").strip()
         return bool(database) and database.lower() != ":memory:"
 
+    @property
+    def is_postgresql(self) -> bool:
+        return self._engine.dialect.name == "postgresql"
+
+    def conflict_insert(self, table: Table) -> Union[SQLiteInsert, PostgreSQLInsert]:
+        if self.is_postgresql:
+            return postgresql_insert(table)
+        return sqlite_insert(table)
+
+    @staticmethod
+    def _lock_postgresql_writes(connection: Connection) -> None:
+        connection.execute(select(func.pg_advisory_xact_lock(_POSTGRESQL_WRITE_LOCK)))
+
+    def acquire_write_lock(self, session: Session, *, exclusive: bool = False) -> None:
+        """Serialize read/modify/write transactions before their first read."""
+        if self._is_sqlite_engine:
+            begin = "BEGIN EXCLUSIVE" if exclusive else "BEGIN IMMEDIATE"
+            session.connection().exec_driver_sql(begin)
+        elif self.is_postgresql:
+            self._lock_postgresql_writes(session.connection())
+
+    def claim_scheduled_analysis(self, occurrence: str, workload: str, now: float) -> bool:
+        statement = self.conflict_insert(ScheduledAnalysisClaim.__table__).values(
+            occurrence=occurrence, workload=workload, claimed_at=now,
+        )
+        with self.session_scope() as session:
+            result = session.execute(
+                statement.on_conflict_do_nothing(index_elements=["occurrence", "workload"])
+                .returning(ScheduledAnalysisClaim.occurrence)
+            )
+            if result.scalar_one_or_none() is None:
+                return False
+            session.execute(delete(ScheduledAnalysisClaim).where(ScheduledAnalysisClaim.claimed_at < now - 7 * 86400))
+            return True
+
     def _run_write_transaction(
         self,
         operation_name: str,
@@ -2404,14 +2456,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             check_cancelled()
             session = self.get_session()
             try:
-                if self._is_sqlite_engine:
-                    # Acquire the SQLite writer lock before any reads inside
-                    # `write_operation()` so pre-write existence checks and the
-                    # later upsert share one consistent write window.
-                    # For cancellable writes, also acquire any reader-blocked
-                    # lock here so COMMIT cannot wait and publish stale data.
-                    begin = "BEGIN EXCLUSIVE" if is_cancelled is not None else "BEGIN IMMEDIATE"
-                    session.connection().exec_driver_sql(begin)
+                self.acquire_write_lock(session, exclusive=is_cancelled is not None)
                 check_cancelled()
                 result = write_operation(session)
                 if is_cancelled is not None:
@@ -3619,98 +3664,42 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         batch_dates = list(records_by_date.keys())
 
         def _write(session: Session) -> int:
-            if self._is_sqlite_engine:
-                # SQLite has a per-statement bind-parameter limit (commonly 999).
-                # Each record has ~17 columns, so chunk upserts to stay within bounds.
-                _SQLITE_CHUNK = 50
-                # `_run_write_transaction()` opens SQLite writes with
-                # `BEGIN IMMEDIATE`, so existence checks and upsert execute
-                # within one stable write window.
-                existing_dates = set()
-                _COUNT_CHUNK = 500
-                for j in range(0, len(batch_dates), _COUNT_CHUNK):
-                    chunk_dates = batch_dates[j : j + _COUNT_CHUNK]
-                    if not chunk_dates:
-                        continue
-                    existing_dates.update(
-                        session.execute(
-                            select(StockDaily.date).where(
-                                and_(
-                                    StockDaily.code == code,
-                                    StockDaily.date.in_(chunk_dates),
-                                )
-                            )
-                        ).scalars().all()
-                    )
-                new_records = [
-                    record for record in records if record['date'] not in existing_dates
-                ]
-                for i in range(0, len(records), _SQLITE_CHUNK):
-                    chunk = records[i : i + _SQLITE_CHUNK]
-                    stmt = sqlite_insert(StockDaily).values(chunk)
-                    excluded = stmt.excluded
+            # The write lock makes the pre-upsert count accurate on both backends.
+            existing_dates = set()
+            for j in range(0, len(batch_dates), 500):
+                existing_dates.update(
                     session.execute(
-                        stmt.on_conflict_do_update(
-                            index_elements=['code', 'date'],
-                            set_={
-                                'open': excluded.open,
-                                'high': excluded.high,
-                                'low': excluded.low,
-                                'close': excluded.close,
-                                'volume': excluded.volume,
-                                'amount': excluded.amount,
-                                'pct_chg': excluded.pct_chg,
-                                'ma5': excluded.ma5,
-                                'ma10': excluded.ma10,
-                                'ma20': excluded.ma20,
-                                'volume_ratio': excluded.volume_ratio,
-                                'data_source': excluded.data_source,
-                                # D1 degrade: never overwrite a previously
-                                # backfilled non-NULL canonical_id with NULL.
-                                'canonical_id': func.coalesce(
-                                    excluded.canonical_id,
-                                    StockDaily.canonical_id,
-                                ),
-                                'updated_at': excluded.updated_at,
-                            },
-                        )
-                    )
-                return len(new_records)
-            else:
-                existing_rows = {
-                    row.date: row
-                    for row in session.execute(
-                        select(StockDaily).where(
-                            and_(
-                                StockDaily.code == code,
-                                StockDaily.date.in_(batch_dates),
-                            )
+                        select(StockDaily.date).where(
+                            StockDaily.code == code, StockDaily.date.in_(batch_dates[j : j + 500]),
                         )
                     ).scalars().all()
-                }
-                new_count = 0
-                for record in records:
-                    existing = existing_rows.get(record['date'])
-                    if existing is None:
-                        session.add(StockDaily(**record))
-                        new_count += 1
-                        continue
-                    existing.open = record['open']
-                    existing.high = record['high']
-                    existing.low = record['low']
-                    existing.close = record['close']
-                    existing.volume = record['volume']
-                    existing.amount = record['amount']
-                    existing.pct_chg = record['pct_chg']
-                    existing.ma5 = record['ma5']
-                    existing.ma10 = record['ma10']
-                    existing.ma20 = record['ma20']
-                    existing.volume_ratio = record['volume_ratio']
-                    existing.data_source = record['data_source']
-                    if record['canonical_id'] is not None:
-                        existing.canonical_id = record['canonical_id']
-                    existing.updated_at = record['updated_at']
-                return new_count
+                )
+            # Stay under the SQLite bind-parameter limit with ~17 columns per row.
+            for i in range(0, len(records), 50):
+                stmt = self.conflict_insert(StockDaily.__table__).values(records[i : i + 50])
+                excluded = stmt.excluded
+                session.execute(
+                    stmt.on_conflict_do_update(
+                        index_elements=['code', 'date'],
+                        set_={
+                            'open': excluded.open,
+                            'high': excluded.high,
+                            'low': excluded.low,
+                            'close': excluded.close,
+                            'volume': excluded.volume,
+                            'amount': excluded.amount,
+                            'pct_chg': excluded.pct_chg,
+                            'ma5': excluded.ma5,
+                            'ma10': excluded.ma10,
+                            'ma20': excluded.ma20,
+                            'volume_ratio': excluded.volume_ratio,
+                            'data_source': excluded.data_source,
+                            'canonical_id': func.coalesce(excluded.canonical_id, StockDaily.canonical_id),
+                            'updated_at': excluded.updated_at,
+                        },
+                    )
+                )
+            return len(records) - len(existing_dates)
 
         try:
             saved_count = self._run_write_transaction(
@@ -3954,6 +3943,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         with self.session_scope() as session:
             if self._is_sqlite_engine:
                 session.connection().exec_driver_sql("BEGIN")
+            elif self.is_postgresql:
+                session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
             state = session.get(ConversationSessionState, session_id)
             messages = session.execute(select(ConversationMessage).where(
                 ConversationMessage.session_id == session_id,
@@ -4126,9 +4117,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             return int(self._insert_conversation_user_turn(session, session_id, content, selected_skill_ids).id)
         return self._run_write_transaction("save_conversation_user_turn", write)
 
-    @staticmethod
     def _insert_conversation_user_turn(
-        session: Session, session_id: str, content: str, selected_skill_ids: Optional[List[str]],
+        self, session: Session, session_id: str, content: str, selected_skill_ids: Optional[List[str]],
     ) -> ConversationMessage:
         msg = ConversationMessage(session_id=session_id, role="user", content=content)
         session.add(msg)
@@ -4138,7 +4128,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             values = {"session_id": session_id,
                       "selected_skill_ids_json": json.dumps(selected_skill_ids, ensure_ascii=False),
                       "created_at": now, "updated_at": now}
-            session.execute(sqlite_insert(ConversationSessionState).values(**values).on_conflict_do_update(
+            stmt = self.conflict_insert(ConversationSessionState.__table__).values(**values)
+            session.execute(stmt.on_conflict_do_update(
                 index_elements=["session_id"],
                 set_={"selected_skill_ids_json": values["selected_skill_ids_json"], "updated_at": now},
             ))
@@ -4451,7 +4442,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 "estimated_tokens": int(estimated_tokens or 0),
                 "updated_at": now,
             }
-            stmt = sqlite_insert(ConversationSummary).values(**values)
+            stmt = self.conflict_insert(ConversationSummary.__table__).values(**values)
             session.execute(
                 stmt.on_conflict_do_update(
                     index_elements=["session_id"],
